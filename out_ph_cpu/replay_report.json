@@ -1,0 +1,20 @@
+{
+  "dataset_hash": "8c23a79e52b7469b916e13b28dab379407a65afd2f97e842533d9cc5b133e5c5",
+  "chip_hash": "5709e7242728499f3e32b68e069c273ac5a74ce8c8d6d80da419db438a65dcaa",
+  "train_acc_per10k": 9330,
+  "test_acc_per10k": 9090,
+  "config": {
+    "task": "PolicyHidden",
+    "seed": 42,
+    "generations": 10,
+    "population": 100,
+    "offspring": 2000,
+    "elite": 10,
+    "max_gates": 16,
+    "mutation_rate_per10k": 1500,
+    "out_dir": "out",
+    "debug": false,
+    "backend": "Cpu"
+  },
+  "replay_ok": true
+}

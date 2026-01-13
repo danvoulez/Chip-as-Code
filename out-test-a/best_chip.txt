@@ -1,0 +1,9 @@
+CHIP v0
+FEATURES n=8
+GATES m=5
+g0 = AND(f1,f1)
+g1 = NOT(f1)
+g2 = NOT(f0)
+g3 = AND(f7,f0)
+g4 = THRESH(1,f1,f0)
+OUTPUT = g4

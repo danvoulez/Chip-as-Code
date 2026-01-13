@@ -1,0 +1,1 @@
+{"cid":"1f7ed0e8655e9fb92d40e85edfa45b15ae0800778c343a9f7c5eb915101723c5","inputs":[{"set":"f3741dbe253a0fa6ebf5bcd92fca0dfaec757d751de1b540aa1a691d5e7789d3"}],"op":"rollup_sum","outputs":[{"set":"9579456da5b699a8f77c460142ce108884997c2cc2c0b7f0ffae461d42486b84"}],"params":{"field":"amount"},"t":"atom.derivation","v":1,"z":"z1"}

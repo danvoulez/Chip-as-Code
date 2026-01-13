@@ -1,0 +1,5 @@
+CHIP v0
+FEATURES n=3
+GATES m=1
+g0 = AND(f0,f1,f2)
+OUTPUT = g0

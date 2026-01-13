@@ -1,0 +1,9 @@
+CHIP v0
+FEATURES n=8
+GATES m=5
+g0 = NOT(f1)
+g1 = AND(f0,g0)
+g2 = NOT(f0)
+g3 = AND(g2,f1)
+g4 = OR(g1,g3)
+OUTPUT = g4

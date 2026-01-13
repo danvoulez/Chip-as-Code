@@ -1,0 +1,20 @@
+{
+  "dataset_hash": "6aeda6b6f60586ff7f80bad941e00103d9a2ff26b6bc08faca8ed5a99ce14407",
+  "chip_hash": "adb9aa1b320978d6f7bd3d2ee591e4bd9fb1224968b0ed5ebac899b6a0d66f2d",
+  "train_acc_per10k": 7250,
+  "test_acc_per10k": 7321,
+  "config": {
+    "task": "Xor",
+    "seed": 1337,
+    "generations": 5,
+    "population": 25,
+    "offspring": 25,
+    "elite": 5,
+    "max_gates": 8,
+    "mutation_rate_per10k": 2000,
+    "out_dir": "out-test-b",
+    "debug": false,
+    "backend": "Cpu"
+  },
+  "replay_ok": true
+}
