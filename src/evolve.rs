@@ -1,4 +1,45 @@
+//! # EvoChip — Discrete Evolution Engine
+//!
+//! Evolve semantic chips through generations using deterministic mutation.
+//! This module implements **integer-only fitness** with **ChaCha20 RNG**
+//! for reproducible evolution across any platform.
+//!
+//! ## Key Properties
+//!
+//! - **Deterministic**: Same seed = same evolution trajectory
+//! - **Integer Fitness**: No floating-point drift between platforms
+//! - **Parallel**: Uses Rayon for population-level parallelism
+//! - **GPU-Ready**: Optional WGPU backend for massive populations
+//!
+//! ## Evolution Operators
+//!
+//! - **Mutation**: Flip gates, change operators, add/remove gates
+//! - **Crossover**: Combine gates from two parent chips
+//! - **Selection**: Tournament selection with elitism
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use chip_as_code::evolve::{EvolutionConfig, Task, Backend, run_evolution};
+//!
+//! let config = EvolutionConfig {
+//!     task: Task::Xor,
+//!     seed: 42,
+//!     generations: 100,
+//!     population: 50,
+//!     offspring: 25,
+//!     elite: 5,
+//!     max_gates: 10,
+//!     mutation_rate_per10k: 1000,
+//!     out_dir: "./evo_output".into(),
+//!     backend: Backend::Cpu,
+//! };
+//!
+//! run_evolution(config)?;
+//! ```
+
 use crate::chip_ir::{random_chip, Chip, ChipHash, Ref};
+#[cfg(feature = "gpu")]
 use crate::gpu_eval::{init_gpu, GpuEvalMetadata, GpuEvaluator};
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
@@ -16,13 +57,19 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+/// The optimization task for evolution.
+///
+/// Each task defines a fitness function that chips are evolved to maximize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Task {
+    /// Learn XOR function: classic boolean benchmark
     Xor,
+    /// Learn a hidden policy chip: reverse-engineering
     PolicyHidden,
 }
 
 impl Task {
+    /// Parse task from string name.
     pub fn from_str(name: &str) -> Option<Self> {
         match name {
             "xor" => Some(Task::Xor),
@@ -31,6 +78,7 @@ impl Task {
         }
     }
 
+    /// Get canonical string representation.
     pub fn as_str(&self) -> &'static str {
         match self {
             Task::Xor => "xor",
@@ -39,13 +87,17 @@ impl Task {
     }
 }
 
+/// Compute backend for chip evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
+    /// CPU with Rayon parallelism
     Cpu,
+    /// GPU with WGPU (requires `gpu` feature)
     Gpu,
 }
 
 impl Backend {
+    /// Parse backend from string name.
     pub fn from_str(name: &str) -> Option<Self> {
         match name {
             "cpu" => Some(Backend::Cpu),
@@ -54,6 +106,7 @@ impl Backend {
         }
     }
 
+    /// Get canonical string representation.
     pub fn as_str(&self) -> &'static str {
         match self {
             Backend::Cpu => "cpu",
@@ -66,44 +119,74 @@ fn default_backend() -> Backend {
     Backend::Cpu
 }
 
+/// Configuration for an evolution run.
+///
+/// All parameters are deterministic — same config + same seed = same results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionConfig {
+    /// The task/fitness function to optimize
     pub task: Task,
+    /// Random seed for reproducibility
     pub seed: u64,
+    /// Number of generations to evolve
     pub generations: usize,
+    /// Population size per generation
     pub population: usize,
+    /// Number of offspring per generation
     pub offspring: usize,
+    /// Number of elite individuals to preserve
     pub elite: usize,
+    /// Maximum gates allowed per chip
     pub max_gates: usize,
+    /// Mutation rate in basis points (1000 = 10%)
     pub mutation_rate_per10k: u32,
+    /// Output directory for results
     pub out_dir: String,
+    /// Enable debug logging
     pub debug: bool,
+    /// Compute backend (CPU or GPU)
     #[serde(default = "default_backend")]
     pub backend: Backend,
 }
 
+/// A single training/test sample.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sample {
+    /// Input feature vector
     pub x: Vec<bool>,
+    /// Expected output
     pub y: bool,
 }
 
+/// Train/test split of a dataset.
 #[derive(Debug, Clone)]
 pub struct DatasetSplit {
+    /// Training samples
     pub train: Vec<Sample>,
+    /// Test samples (held out)
     pub test: Vec<Sample>,
+    /// Number of features per sample
     pub features: usize,
+    /// BLAKE3 hash of the dataset for verification
     pub hash_hex: String,
 }
 
+/// Statistics about a dataset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetStats {
+    /// Number of training samples
     pub train_size: usize,
+    /// Number of test samples
     pub test_size: usize,
+    /// Positive examples in training set
     pub train_pos: usize,
+    /// Negative examples in training set
     pub train_neg: usize,
+    /// Positive examples in test set
     pub test_pos: usize,
+    /// Negative examples in test set
     pub test_neg: usize,
+    /// Preview of samples
     pub samples: Vec<SampleView>,
 }
 
@@ -171,11 +254,13 @@ pub struct ScoredChip {
 #[derive(Debug, Clone)]
 pub struct EvalBackendInfo {
     pub backend: Backend,
+    #[cfg(feature = "gpu")]
     pub gpu: Option<GpuEvalMetadata>,
 }
 
 struct EvalEngine {
     backend: Backend,
+    #[cfg(feature = "gpu")]
     gpu: Option<GpuEvaluator>,
 }
 
@@ -429,6 +514,7 @@ fn breed(
     Ok((next, clones))
 }
 
+#[cfg(feature = "gpu")]
 fn per10k(correct: u32, total: usize) -> u32 {
     if total == 0 {
         return 0;
@@ -464,17 +550,37 @@ fn evaluate_chip_cpu(chip: &Chip, split: &DatasetSplit) -> ScoredChip {
 
 impl EvalEngine {
     fn new(backend: Backend, split: &DatasetSplit) -> Result<Self> {
-        let gpu = match backend {
-            Backend::Cpu => None,
-            Backend::Gpu => Some(init_gpu(split)?),
-        };
-        Ok(EvalEngine { backend, gpu })
+        #[cfg(feature = "gpu")]
+        {
+            let gpu = match backend {
+                Backend::Cpu => None,
+                Backend::Gpu => Some(init_gpu(split)?),
+            };
+            Ok(EvalEngine { backend, gpu })
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = split; // silence unused warning
+            if backend == Backend::Gpu {
+                return Err(anyhow!("GPU backend requires --features gpu"));
+            }
+            Ok(EvalEngine { backend })
+        }
     }
 
     fn info(&self) -> EvalBackendInfo {
-        EvalBackendInfo {
-            backend: self.backend,
-            gpu: self.gpu.as_ref().map(|g| g.metadata.clone()),
+        #[cfg(feature = "gpu")]
+        {
+            EvalBackendInfo {
+                backend: self.backend,
+                gpu: self.gpu.as_ref().map(|g| g.metadata.clone()),
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            EvalBackendInfo {
+                backend: self.backend,
+            }
         }
     }
 
@@ -485,24 +591,31 @@ impl EvalEngine {
                 .map(|c| evaluate_chip_cpu(c, split))
                 .collect()),
             Backend::Gpu => {
-                let gpu = self
-                    .gpu
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("gpu backend not initialized"))?;
-                let (train_counts, test_counts) = gpu.evaluate(pop)?;
-                if train_counts.len() != pop.len() || test_counts.len() != pop.len() {
-                    return Err(anyhow!("gpu counts length mismatch"));
+                #[cfg(feature = "gpu")]
+                {
+                    let gpu = self
+                        .gpu
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("gpu backend not initialized"))?;
+                    let (train_counts, test_counts) = gpu.evaluate(pop)?;
+                    if train_counts.len() != pop.len() || test_counts.len() != pop.len() {
+                        return Err(anyhow!("gpu counts length mismatch"));
+                    }
+                    let mut scored = Vec::with_capacity(pop.len());
+                    for (idx, chip) in pop.iter().enumerate() {
+                        scored.push(ScoredChip {
+                            chip: chip.clone(),
+                            train_acc_per10k: per10k(train_counts[idx], split.train.len()),
+                            test_acc_per10k: per10k(test_counts[idx], split.test.len()),
+                            live_gates: chip.live_gate_count(),
+                        });
+                    }
+                    Ok(scored)
                 }
-                let mut scored = Vec::with_capacity(pop.len());
-                for (idx, chip) in pop.iter().enumerate() {
-                    scored.push(ScoredChip {
-                        chip: chip.clone(),
-                        train_acc_per10k: per10k(train_counts[idx], split.train.len()),
-                        test_acc_per10k: per10k(test_counts[idx], split.test.len()),
-                        live_gates: chip.live_gate_count(),
-                    });
+                #[cfg(not(feature = "gpu"))]
+                {
+                    Err(anyhow!("GPU backend requires --features gpu"))
                 }
-                Ok(scored)
             }
         }
     }
@@ -511,11 +624,18 @@ impl EvalEngine {
         match self.backend {
             Backend::Cpu => Ok(evaluate_chip_cpu(chip, split)),
             Backend::Gpu => {
-                let scored = self.evaluate_population(std::slice::from_ref(chip), split)?;
-                scored
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("empty gpu eval"))
+                #[cfg(feature = "gpu")]
+                {
+                    let scored = self.evaluate_population(std::slice::from_ref(chip), split)?;
+                    scored
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow!("empty gpu eval"))
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    Err(anyhow!("GPU backend requires --features gpu"))
+                }
             }
         }
     }
@@ -665,9 +785,13 @@ pub fn stats(task: Task, seed: u64) -> Result<DatasetStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "gpu")]
     use std::fs::File;
+    #[cfg(feature = "gpu")]
     use std::io::{BufRead, BufReader};
+    #[cfg(feature = "gpu")]
     use std::path::Path;
+    #[cfg(feature = "gpu")]
     use tempfile::tempdir;
 
     #[test]
@@ -710,7 +834,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu")]
     fn gpu_matches_cpu_single_chip() {
+        // Skip if no GPU adapter available
         let dataset = generate_xor(2024);
         let split = split_dataset(dataset, 2024);
         let chip = Chip::parse(
@@ -718,14 +844,29 @@ mod tests {
         )
         .unwrap();
         let cpu = evaluate_chip_cpu(&chip, &split);
-        let engine = EvalEngine::new(Backend::Gpu, &split).unwrap();
+        let engine = match EvalEngine::new(Backend::Gpu, &split) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Skipping GPU test: no GPU adapter available ({e})");
+                return;
+            }
+        };
         let gpu = engine.evaluate_chip(&chip, &split).unwrap();
         assert_eq!(cpu.train_acc_per10k, gpu.train_acc_per10k);
         assert_eq!(cpu.test_acc_per10k, gpu.test_acc_per10k);
     }
 
     #[test]
+    #[cfg(feature = "gpu")]
     fn evolve_gpu_matches_cpu_small_run() {
+        // Skip if no GPU adapter available
+        let dataset = generate_xor(99);
+        let split = split_dataset(dataset, 99);
+        if EvalEngine::new(Backend::Gpu, &split).is_err() {
+            eprintln!("Skipping GPU test: no GPU adapter available");
+            return;
+        }
+        
         let dir = tempdir().unwrap();
         let cpu_out = dir.path().join("cpu");
         let gpu_out = dir.path().join("gpu");
@@ -758,6 +899,7 @@ mod tests {
         assert_eq!(cid_cpu, cid_gpu);
     }
 
+    #[cfg(feature = "gpu")]
     fn last_training_cid(out_dir: &str) -> String {
         let path = Path::new(out_dir).join("training_curve.ndjson");
         let file = File::open(&path).expect("training_curve exists");

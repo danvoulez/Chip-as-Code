@@ -1,1 +1,0 @@
-{"cid":"23876f4de1baa7fb070f113d55698b39d2fd50529b0baf658629a58a7af6453b","payload":{"chip_hash":"65f8a4609d094339503c569f52a2773465d3f777b73069a17df28df2630e4561","chip_text":"CHIP v0\nFEATURES n=8\nGATES m=3\ng0 = AND(f1,f0)\ng1 = NOT(g0)\ng2 = OR(g1,f5)\nOUTPUT = g1\n","test_acc_per10k":8035,"train_acc_per10k":7650},"t":"atom.fact","v":1}

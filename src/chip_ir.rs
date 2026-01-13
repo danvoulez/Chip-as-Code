@@ -1,3 +1,25 @@
+//! # Chip IR — Intermediate Representation for Semantic Chips
+//!
+//! This module provides the core data structures and algorithms for parsing,
+//! evaluating, and hashing semantic chips defined in the `.chip` text DNA format.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use chip_as_code::Chip;
+//!
+//! let chip = Chip::parse(r#"
+//!     CHIP v0
+//!     FEATURES n=2
+//!     GATES m=1
+//!     g0 = AND(f0,f1)
+//!     OUTPUT = g0
+//! "#).unwrap();
+//!
+//! assert!(chip.eval(&[true, true]).unwrap());
+//! assert!(!chip.eval(&[true, false]).unwrap());
+//! ```
+
 use blake3::Hasher;
 use logline::json_atomic;
 use rand::Rng;
@@ -7,6 +29,9 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// Hash of a chip (hex-encoded BLAKE3 of JSON✯Atomic canonical bytes).
+///
+/// This is the canonical identity of a chip — two chips with the same
+/// semantic behavior will have the same hash.
 pub type ChipHash = String;
 
 #[derive(Serialize)]
@@ -18,46 +43,108 @@ struct ChipAtom<'a> {
     output: &'a Ref,
 }
 
+/// A semantic chip — a boolean circuit defined as a DAG of gates.
+///
+/// # DNA Format
+///
+/// ```text
+/// CHIP v0
+/// FEATURES n=<N>
+/// GATES m=<M>
+/// g0 = OP(inputs...)
+/// ...
+/// OUTPUT = gK
+/// ```
+///
+/// # Example
+///
+/// ```rust
+/// use chip_as_code::Chip;
+///
+/// let xor = Chip::parse(r#"
+///     CHIP v0
+///     FEATURES n=2
+///     GATES m=5
+///     g0 = NOT(f1)
+///     g1 = AND(f0,g0)
+///     g2 = NOT(f0)
+///     g3 = AND(g2,f1)
+///     g4 = OR(g1,g3)
+///     OUTPUT = g4
+/// "#).unwrap();
+///
+/// // XOR truth table
+/// assert!(!xor.eval(&[false, false]).unwrap());
+/// assert!(xor.eval(&[true, false]).unwrap());
+/// assert!(xor.eval(&[false, true]).unwrap());
+/// assert!(!xor.eval(&[true, true]).unwrap());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chip {
+    /// Number of input features (f0, f1, ..., fN-1)
     pub features: usize,
+    /// Gates in evaluation order (g0, g1, ..., gM-1)
     pub gates: Vec<Gate>,
+    /// Output reference (which gate or feature produces the final result)
     pub output: Ref,
 }
 
+/// A single gate in the chip circuit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gate {
+    /// The gate operation
     pub op: GateOp,
 }
 
+/// Gate operation types.
+///
+/// These are the primitive operations that make up a semantic chip.
+/// They correspond to the "semantic transistors" in the Chip as Code paradigm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateOp {
+    /// Logical AND: all inputs must be true
     And(Vec<Ref>),
+    /// Logical OR: at least one input must be true
     Or(Vec<Ref>),
+    /// Logical NOT: negate single input
     Not(Ref),
+    /// Threshold: at least k inputs must be true
     Threshold { k: usize, inputs: Vec<Ref> },
 }
 
+/// Reference to a feature or gate output.
+///
+/// Gates can only reference earlier gates (forming a DAG).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ref {
+    /// Reference to input feature fN
     Feature(usize),
+    /// Reference to gate output gN
     Gate(usize),
 }
 
+/// Errors that can occur when parsing a chip.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ChipParseError {
+    /// Input was empty or whitespace-only
     #[error("empty input")]
     Empty,
+    /// Missing or invalid "CHIP v0" header
     #[error("invalid header")]
     InvalidHeader,
+    /// Missing or invalid "FEATURES n=N" line
     #[error("invalid features line")]
     InvalidFeatures,
+    /// Missing or invalid "GATES m=M" line
     #[error("invalid gates line")]
     InvalidGates,
+    /// Invalid gate definition line
     #[error("invalid gate line: {0}")]
     InvalidGate(String),
+    /// Missing or invalid "OUTPUT = gK" line
     #[error("invalid output line")]
     InvalidOutput,
+    /// Gate references a feature or gate that doesn't exist
     #[error("reference out of range")]
     RefOutOfRange,
 }
@@ -222,7 +309,8 @@ impl Chip {
             ToggleOp,
             AddGate,
             RemoveGate,
-            WrapNot,
+            /// Replaces the gate's operation with NOT(random_ref). Does NOT wrap the existing gate.
+            ReplaceWithNot,
             AdjustThresh,
         }
         let choices = [
@@ -231,7 +319,7 @@ impl Chip {
             MutKind::ToggleOp,
             MutKind::AddGate,
             MutKind::RemoveGate,
-            MutKind::WrapNot,
+            MutKind::ReplaceWithNot,
             MutKind::AdjustThresh,
         ];
         let choice = choices[rng.gen_range(0..choices.len())];
@@ -288,12 +376,13 @@ impl Chip {
                     }
                 }
             }
-            MutKind::WrapNot => {
+            MutKind::ReplaceWithNot => {
                 if next.gates.is_empty() {
                     return next;
                 }
                 let idx = rng.gen_range(0..next.gates.len());
                 if let Some(gate) = next.gates.get_mut(idx) {
+                    // Replace gate op with NOT(random_ref), does not preserve original logic
                     let r = biased_random_ref(rng, next.features, idx, bias_primary_inputs)
                         .unwrap_or_else(|| random_ref(rng, next.features, idx));
                     gate.op = GateOp::Not(r);

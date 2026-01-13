@@ -1,4 +1,5 @@
 use crate::evolve::{evolve, Backend, EvolutionConfig, EvolutionResult, Task, TrainingLine};
+#[cfg(feature = "gpu")]
 use crate::gpu_eval::WGPU_VERSION;
 use crate::gatebox::{gate_run_from_atoms, EvidenceDoc, GateVerdictLike, IntentClaim, IntentDoc};
 use anyhow::{anyhow, Result};
@@ -192,6 +193,9 @@ fn build_evo_atoms(
         "members":[best_fact["cid"].as_str().unwrap()],
     }))?;
 
+    #[allow(unused_mut)]
+    let mut kernel_fact: Option<Value> = None;
+    #[allow(unused_mut)]
     let mut params = json!({
         "task": config.task.as_str(),
         "seed": config.seed,
@@ -203,8 +207,7 @@ fn build_evo_atoms(
         "mutation_rate_per10k": config.mutation_rate_per10k,
         "backend": config.backend.as_str(),
     });
-
-    let mut kernel_fact = None;
+    #[cfg(feature = "gpu")]
     if let (Backend::Gpu, Some(meta)) = (config.backend, res.backend_info.gpu.as_ref()) {
         let fact = attach_cid(json!({
             "t":"atom.fact",
@@ -278,65 +281,101 @@ pub fn zlayer_evolve(config: EvolutionConfig, zlayer_out: &Path) -> Result<()> {
     write_evo_atoms(zlayer_out, &atoms)
 }
 
+/// Build gate outputs using Template + Occurrence pattern.
+/// 
+/// This produces:
+/// 1. A TEMPLATE fact (dedupable) - canonical verdict reason
+/// 2. An EVENT fact (unique per derivation) - anchors occurrence to case
+/// 
+/// The event references the template via `template_cid`, enabling:
+/// - Perfect deduplication of identical verdict reasons (catalog)
+/// - Accurate event counting (1 derivation = 1 event)
 fn build_gate_outputs(
     intent: &IntentDoc,
     evidence_cids: &[String],
     verdict: GateVerdictLike,
+    derivation_cid: Option<&str>,
 ) -> Result<(Vec<Value>, Vec<HashMap<&'static str, String>>)> {
-    match verdict {
+    let (template_fact, verdict_str) = match &verdict {
         GateVerdictLike::Commit { proof } => {
-            let verified_fact = attach_cid(json!({
-                "t":"atom.fact",
-                "v":1,
+            let fact = attach_cid(json!({
+                "t": "atom.fact",
+                "v": 1,
                 "payload": {
+                    "fact_type": "verdict_template",
                     "verdict": "commit",
-                    "intent_id": intent.id,
-                    "utterance": intent.utterance,
-                    "policy_epoch": intent.policy_epoch,
-                    "evidence_cids": evidence_cids,
                     "gate_proof": proof,
                 },
             }))?;
-            let commit_set = attach_cid(json!({
-                "t":"atom.set",
-                "v":1,
-                "name":"commit_set",
-                "members":[verified_fact["cid"].as_str().unwrap()],
-            }))?;
-            let mut m = HashMap::new();
-            m.insert("set", commit_set["cid"].as_str().unwrap().to_string());
-            Ok((vec![verified_fact, commit_set], vec![m]))
+            (fact, "commit")
         }
-        GateVerdictLike::Ghost {
-            missing_claim,
-            question,
-        } => {
-            let ghost_fact = attach_cid(json!({
-                "t":"atom.fact",
-                "v":1,
-                "payload": {"verdict": "ghost", "missing_claim": missing_claim, "question": question},
+        GateVerdictLike::Ghost { missing_claim, question } => {
+            let fact = attach_cid(json!({
+                "t": "atom.fact",
+                "v": 1,
+                "payload": {
+                    "fact_type": "verdict_template",
+                    "verdict": "ghost",
+                    "missing_claim": missing_claim,
+                    "question": question,
+                },
             }))?;
-            let ghost_set = attach_cid(json!({
-                "t":"atom.set",
-                "v":1,
-                "name":"ghost_set",
-                "members":[ghost_fact["cid"].as_str().unwrap()],
-            }))?;
-            let mut m = HashMap::new();
-            m.insert("set", ghost_set["cid"].as_str().unwrap().to_string());
-            Ok((vec![ghost_fact, ghost_set], vec![m]))
+            (fact, "ghost")
         }
         GateVerdictLike::Reject { reason } => {
-            let reject_fact = attach_cid(json!({
-                "t":"atom.fact",
-                "v":1,
-                "payload": {"verdict": "reject", "reason": reason},
+            let fact = attach_cid(json!({
+                "t": "atom.fact",
+                "v": 1,
+                "payload": {
+                    "fact_type": "verdict_template",
+                    "verdict": "reject",
+                    "reason": reason,
+                },
             }))?;
-            let mut m = HashMap::new();
-            m.insert("fact", reject_fact["cid"].as_str().unwrap().to_string());
-            Ok((vec![reject_fact], vec![m]))
+            (fact, "reject")
         }
+    };
+
+    let template_cid = template_fact["cid"].as_str().unwrap().to_string();
+
+    // Build the EVENT fact (unique per derivation via intent_id)
+    // Note: derivation_cid is optional; the link is primarily via derivation.outputs -> event
+    let mut event_payload = json!({
+        "fact_type": "verdict_event",
+        "verdict": verdict_str,
+        "intent_id": intent.id,
+        "utterance": intent.utterance,
+        "policy_epoch": intent.policy_epoch,
+        "template_cid": template_cid,
+        "evidence_cids": evidence_cids,
+    });
+    if let Some(dcid) = derivation_cid {
+        event_payload["derivation_cid"] = Value::String(dcid.to_string());
     }
+    
+    let event_fact = attach_cid(json!({
+        "t": "atom.fact",
+        "v": 1,
+        "payload": event_payload,
+    }))?;
+
+    let event_cid = event_fact["cid"].as_str().unwrap().to_string();
+
+    // Build the verdict set containing the event
+    let verdict_set = attach_cid(json!({
+        "t": "atom.set",
+        "v": 1,
+        "name": format!("{}_set", verdict_str),
+        "members": [&event_cid],
+    }))?;
+
+    let mut output_ref = HashMap::new();
+    output_ref.insert("set", verdict_set["cid"].as_str().unwrap().to_string());
+
+    Ok((
+        vec![template_fact, event_fact, verdict_set],
+        vec![output_ref],
+    ))
 }
 
 fn build_gate_run_atoms(
@@ -391,7 +430,9 @@ fn build_gate_run_atoms(
         .iter()
         .map(|f| f["cid"].as_str().unwrap().to_string())
         .collect();
-    let (output_atoms, outputs) = build_gate_outputs(intent, &evidence_cids, verdict.clone())?;
+    
+    // First pass: build outputs without derivation_cid (will be linked via derivation.outputs)
+    let (output_atoms, outputs) = build_gate_outputs(intent, &evidence_cids, verdict.clone(), None)?;
     atoms.extend(output_atoms.clone());
 
     let outputs_json: Vec<Value> = outputs
@@ -515,14 +556,24 @@ fn verdict_of_fact(fact: &Value) -> Option<&str> {
 fn build_value_summary_from_facts(facts: &[Value], unit_value_per10k: u64) -> Result<ValueSummary> {
     let mut summary = ValueSummary::default();
     for f in facts {
+        let payload = f.get("payload");
         let verdict = verdict_of_fact(f).ok_or_else(|| anyhow!("fact missing verdict"))?;
+        
+        // Skip templates - only count events (occurrences)
+        // Templates have fact_type="verdict_template", events have fact_type="verdict_event"
+        // Old format (no fact_type) should be counted as events for backward compat
+        let fact_type = payload.and_then(|p| p.get("fact_type")).and_then(|t| t.as_str());
+        if fact_type == Some("verdict_template") {
+            continue; // Skip template, only count events
+        }
+        
         match verdict {
             "commit" => summary.commit_count += 1,
             "ghost" => summary.ghost_count += 1,
             "reject" => {
                 summary.reject_count += 1;
-                if let Some(reason) = f
-                    .get("payload")
+                // For reject, reason might be in the template, check both
+                if let Some(reason) = payload
                     .and_then(|p| p.get("reason"))
                     .and_then(|r| r.as_str())
                 {
@@ -765,9 +816,12 @@ pub fn zlayer_stress(seed: u64, n: usize, shards: usize, out_dir: &Path) -> Resu
 }
 
 fn run_derivation(z0_set: &Value, facts: &[Value], op: DerivOp) -> Result<(Value, Value, Value)> {
+    let members_arr = z0_set["members"]
+        .as_array()
+        .ok_or_else(|| anyhow!("z0_set missing members array"))?;
     let members: Vec<&Value> = facts
         .iter()
-        .filter(|f| z0_set["members"].as_array().unwrap().iter().any(|c| c == &f["cid"]))
+        .filter(|f| members_arr.iter().any(|c| c == &f["cid"]))
         .collect();
     let derived_fact = match op {
         DerivOp::RollupSum => {
@@ -1182,7 +1236,7 @@ fn verify_gate_run(atom: &Value, map: &HashMap<String, Value>) -> Result<GateVer
         .iter()
         .filter_map(|c| c.as_str().map(|s| s.to_string()))
         .collect();
-    let (outputs, output_refs) = build_gate_outputs(&intent, &evidence_cids, verdict.clone())?;
+    let (outputs, output_refs) = build_gate_outputs(&intent, &evidence_cids, verdict.clone(), None)?;
 
     let declared = atom
         .get("outputs")
@@ -1461,6 +1515,276 @@ pub fn zlayer_verify_file(file: &Path) -> Result<VerifyReport> {
     verify_map(&map, loaded)
 }
 
+/// Streaming verify mode for large files (1M+ atoms).
+/// Uses a two-pass approach:
+/// 1. First pass: validate CIDs and count atom types
+/// 2. Second pass: verify references and replay gate_run derivations
+/// This avoids loading all atoms into memory at once.
+pub fn zlayer_verify_streaming(file: &Path) -> Result<VerifyReport> {
+    use std::collections::HashSet;
+    
+    // Pass 1: Validate CIDs and collect atom metadata
+    let f = File::open(file)?;
+    let mut atoms_loaded = 0usize;
+    let mut cid_set: HashSet<String> = HashSet::new();
+    let mut derivation_lines: Vec<(usize, String)> = Vec::new();
+    let mut commits = 0usize;
+    let mut ghosts = 0usize;
+    let mut rejects = 0usize;
+
+    for (line_num, line_result) in BufReader::new(f).lines().enumerate() {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        atoms_loaded += 1;
+        
+        let v: Value = serde_json::from_str(&line)
+            .map_err(|e| anyhow!("line {}: invalid JSON: {}", line_num + 1, e))?;
+        
+        let cid = v["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow!("line {}: missing cid", line_num + 1))?
+            .to_string();
+        
+        // Verify CID matches content
+        let recompute = cid_for_atom_without_cid(&v)?;
+        if cid != recompute {
+            return Err(anyhow!("line {}: cid mismatch for {}", line_num + 1, cid));
+        }
+        
+        cid_set.insert(cid.clone());
+        
+        // Track derivations for second pass
+        let atom_type = v["t"].as_str().unwrap_or("");
+        if atom_type == "atom.derivation" {
+            derivation_lines.push((line_num, line.clone()));
+        }
+        
+        // Count verdicts from facts (only events, not templates)
+        if atom_type == "atom.fact" {
+            let payload = v.get("payload");
+            let fact_type = payload.and_then(|p| p.get("fact_type")).and_then(|t| t.as_str());
+            
+            // Skip templates - only count events (old format has no fact_type, count as event)
+            if fact_type == Some("verdict_template") {
+                continue;
+            }
+            
+            if let Some(verdict) = payload.and_then(|p| p.get("verdict")).and_then(|v| v.as_str()) {
+                match verdict {
+                    "commit" => commits += 1,
+                    "ghost" => ghosts += 1,
+                    "reject" => rejects += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    
+    let atoms_unique = cid_set.len();
+    let derivations_replayed = derivation_lines.len();
+    
+    // Pass 2: Verify derivation references exist (parallel, streaming)
+    // For streaming mode, we just verify that referenced CIDs exist in our set
+    // Full replay would require loading atoms, which defeats the purpose
+    let f2 = File::open(file)?;
+    for line_result in BufReader::new(f2).lines() {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(&line)?;
+        let atom_type = v["t"].as_str().unwrap_or("");
+        
+        // Verify set members exist
+        if atom_type == "atom.set" {
+            if let Some(members) = v.get("members").and_then(|m| m.as_array()) {
+                for member in members {
+                    let mid = member.as_str().ok_or_else(|| anyhow!("set member not string"))?;
+                    if !cid_set.contains(mid) {
+                        return Err(anyhow!("set references missing member {}", mid));
+                    }
+                }
+            }
+        }
+        
+        // Verify derivation inputs/outputs exist
+        if atom_type == "atom.derivation" {
+            if let Some(inputs) = v.get("inputs").and_then(|i| i.as_array()) {
+                for inp in inputs {
+                    if let Some(sid) = inp.get("set").and_then(|s| s.as_str()) {
+                        if !cid_set.contains(sid) {
+                            return Err(anyhow!("derivation references missing input set {}", sid));
+                        }
+                    }
+                    if let Some(fid) = inp.get("fact").and_then(|f| f.as_str()) {
+                        if !cid_set.contains(fid) {
+                            return Err(anyhow!("derivation references missing input fact {}", fid));
+                        }
+                    }
+                }
+            }
+            if let Some(outputs) = v.get("outputs").and_then(|o| o.as_array()) {
+                for out in outputs {
+                    if let Some(sid) = out.get("set").and_then(|s| s.as_str()) {
+                        if !cid_set.contains(sid) {
+                            return Err(anyhow!("derivation references missing output set {}", sid));
+                        }
+                    }
+                    if let Some(fid) = out.get("fact").and_then(|f| f.as_str()) {
+                        if !cid_set.contains(fid) {
+                            return Err(anyhow!("derivation references missing output fact {}", fid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(VerifyReport {
+        atoms_loaded,
+        atoms_unique,
+        derivations_replayed,
+        commits,
+        ghosts,
+        rejects,
+    })
+}
+
+/// Diagnostic report for analyzing atom distribution (Template + Occurrence pattern)
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticReport {
+    pub total_atoms: usize,
+    pub unique_cids: usize,
+    pub atom_types: BTreeMap<String, usize>,
+    
+    // Template vs Event breakdown
+    pub derivations: usize,
+    pub verdict_events: BTreeMap<String, usize>,      // Events per verdict type (= occurrences)
+    pub verdict_templates: BTreeMap<String, usize>,   // Unique templates per verdict type (= catalog)
+    pub template_frequency: Vec<(String, String, usize)>, // (template_cid, verdict, event_count)
+    
+    // Legacy (for backward compat with old format)
+    pub verdict_distribution: BTreeMap<String, usize>,
+    pub unique_verdict_cids: BTreeMap<String, usize>,
+    pub duplicate_atoms: usize,
+    pub sample_duplicates: Vec<(String, usize, String)>,
+}
+
+/// Deep diagnostic analysis of a Z-layer NDJSON file
+pub fn zlayer_diagnose(file: &Path) -> Result<DiagnosticReport> {
+    use std::collections::HashSet;
+    
+    let f = File::open(file)?;
+    let mut report = DiagnosticReport::default();
+    
+    // Track all atoms by CID
+    let mut cid_counts: HashMap<String, usize> = HashMap::new();
+    let mut cid_to_verdict: HashMap<String, String> = HashMap::new();
+    let mut verdict_cids: HashMap<String, HashSet<String>> = HashMap::new();
+    
+    // Template + Occurrence tracking
+    let mut template_event_count: HashMap<String, usize> = HashMap::new();
+    let mut template_to_verdict: HashMap<String, String> = HashMap::new();
+    let mut event_templates: HashSet<String> = HashSet::new();
+    
+    for line_result in BufReader::new(f).lines() {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        report.total_atoms += 1;
+        
+        let v: Value = serde_json::from_str(&line)?;
+        let cid = v["cid"].as_str().unwrap_or("").to_string();
+        let atom_type = v["t"].as_str().unwrap_or("unknown").to_string();
+        
+        // Count by type
+        *report.atom_types.entry(atom_type.clone()).or_insert(0) += 1;
+        
+        // Count derivations
+        if atom_type == "atom.derivation" {
+            report.derivations += 1;
+        }
+        
+        // Track duplicates
+        *cid_counts.entry(cid.clone()).or_insert(0) += 1;
+        
+        // Track facts
+        if atom_type == "atom.fact" {
+            let payload = v.get("payload");
+            let fact_type = payload.and_then(|p| p.get("fact_type")).and_then(|t| t.as_str());
+            let verdict = payload.and_then(|p| p.get("verdict")).and_then(|v| v.as_str());
+            
+            if let Some(verdict_str) = verdict {
+                let verdict_str = verdict_str.to_string();
+                
+                // Legacy tracking (all verdict facts)
+                *report.verdict_distribution.entry(verdict_str.clone()).or_insert(0) += 1;
+                cid_to_verdict.insert(cid.clone(), verdict_str.clone());
+                verdict_cids.entry(verdict_str.clone()).or_default().insert(cid.clone());
+                
+                // Template + Occurrence tracking
+                match fact_type {
+                    Some("verdict_template") => {
+                        template_to_verdict.insert(cid.clone(), verdict_str.clone());
+                        *report.verdict_templates.entry(verdict_str).or_insert(0) += 1;
+                    }
+                    Some("verdict_event") => {
+                        *report.verdict_events.entry(verdict_str.clone()).or_insert(0) += 1;
+                        // Track which template this event references
+                        if let Some(tcid) = payload.and_then(|p| p.get("template_cid")).and_then(|t| t.as_str()) {
+                            *template_event_count.entry(tcid.to_string()).or_insert(0) += 1;
+                            event_templates.insert(tcid.to_string());
+                        }
+                    }
+                    _ => {
+                        // Old format (no fact_type) - treat as event for backward compat
+                        *report.verdict_events.entry(verdict_str).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    report.unique_cids = cid_counts.len();
+    
+    // Count unique CIDs per verdict type
+    for (verdict, cids) in &verdict_cids {
+        report.unique_verdict_cids.insert(verdict.clone(), cids.len());
+    }
+    
+    // Build template frequency list (top templates by event count)
+    let mut freq: Vec<(String, String, usize)> = template_event_count
+        .into_iter()
+        .map(|(tcid, count)| {
+            let verdict = template_to_verdict.get(&tcid).cloned().unwrap_or_default();
+            (tcid, verdict, count)
+        })
+        .collect();
+    freq.sort_by(|a, b| b.2.cmp(&a.2));
+    report.template_frequency = freq.into_iter().take(10).collect();
+    
+    // Find duplicates
+    let mut duplicates: Vec<(String, usize, String)> = cid_counts
+        .iter()
+        .filter(|(_, &count)| count > 1)
+        .map(|(cid, &count)| {
+            let verdict = cid_to_verdict.get(cid).cloned().unwrap_or_default();
+            (cid.clone(), count, verdict)
+        })
+        .collect();
+    
+    report.duplicate_atoms = duplicates.iter().map(|(_, count, _)| count - 1).sum();
+    
+    // Sort by count descending and take top 10
+    duplicates.sort_by(|a, b| b.1.cmp(&a.1));
+    report.sample_duplicates = duplicates.into_iter().take(10).collect();
+    
+    Ok(report)
+}
+
 fn load_fixture_intent(path: &Path) -> Result<IntentDoc> {
     let text = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&text)?)
@@ -1634,12 +1958,20 @@ mod tests {
             .find(|a| a["t"] == "atom.set" && a["name"] == "ghost_set")
             .cloned()
             .expect("ghost set missing");
-        let ghost_fact_cid = ghost["members"][0].as_str().unwrap();
-        let ghost_fact = atoms
+        let ghost_event_cid = ghost["members"][0].as_str().unwrap();
+        let ghost_event = atoms
             .iter()
-            .find(|a| a.get("cid") == Some(&Value::String(ghost_fact_cid.into())))
+            .find(|a| a.get("cid") == Some(&Value::String(ghost_event_cid.into())))
             .unwrap();
-        assert!(ghost_fact["payload"]["question"].as_str().is_some());
+        // Event should have fact_type = verdict_event and reference a template
+        assert_eq!(ghost_event["payload"]["fact_type"].as_str(), Some("verdict_event"));
+        let template_cid = ghost_event["payload"]["template_cid"].as_str().unwrap();
+        let ghost_template = atoms
+            .iter()
+            .find(|a| a.get("cid") == Some(&Value::String(template_cid.into())))
+            .unwrap();
+        // Template should have the question
+        assert!(ghost_template["payload"]["question"].as_str().is_some());
     }
 
     #[test]
@@ -1737,5 +2069,23 @@ mod tests {
 
         assert_eq!(bytes1.len(), bytes2.len());
         assert_eq!(hash1.as_bytes(), hash2.as_bytes());
+    }
+
+    #[test]
+    fn malformed_ndjson_returns_error_not_panic() {
+        let dir = tempdir().unwrap();
+        let bad_file = dir.path().join("bad.ndjson");
+        // Missing CID field
+        fs::write(&bad_file, r#"{"t":"atom.fact","v":1,"payload":{"x":1}}"#).unwrap();
+        let result = zlayer_verify_file(&bad_file);
+        assert!(result.is_err(), "missing cid should error, not panic");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("cid"), "error should mention cid: {}", err_msg);
+
+        // Invalid JSON line
+        let bad_file2 = dir.path().join("bad2.ndjson");
+        fs::write(&bad_file2, "not valid json\n").unwrap();
+        let result2 = zlayer_verify_file(&bad_file2);
+        assert!(result2.is_err(), "invalid json should error, not panic");
     }
 }

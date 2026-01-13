@@ -1,2 +1,16 @@
 /target
 /out
+
+# Credentials - NEVER commit
+.env
+.env.*
+*.token
+credentials/
+
+# Private keys - NEVER commit
+*.pem
+*.key
+*.p12
+
+# Build outputs
+out_*/

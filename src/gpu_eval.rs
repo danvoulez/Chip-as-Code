@@ -1,3 +1,7 @@
+//! GPU evaluation backend using wgpu/WGSL compute shaders.
+//! This module is only compiled when the `gpu` feature is enabled.
+#![cfg(feature = "gpu")]
+
 use crate::chip_ir::{Chip, GateOp, Ref};
 use crate::evolve::{DatasetSplit, Sample};
 use anyhow::{anyhow, Result};

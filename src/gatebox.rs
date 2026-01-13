@@ -1,3 +1,34 @@
+//! # GateBox — Constitutional Checkpoint
+//!
+//! The GateBox implements the **No-Guess Law**: every decision must be one of:
+//!
+//! - **`Commit`** — Full evidence anchored, chip evaluates to true → write to ledger
+//! - **`Ghost`** — Missing evidence → ask a clarifying question, no side effects
+//! - **`Reject`** — Contradictory evidence or chip fails → refuse with reason
+//!
+//! ## The No-Guess Principle
+//!
+//! An LLM can never invent facts. If evidence is missing, it must ask.
+//! If evidence contradicts, it must reject. Only with full anchored
+//! evidence can it commit an action to the immutable ledger.
+//!
+//! ## Example Flow
+//!
+//! ```text
+//! Intent: "Transfer $500 to savings"
+//! Evidence: [bank_connected: true, balance: 1200]
+//! Chip: AND(bank_connected, sufficient_balance)
+//!
+//! → Chip evaluates TRUE with all evidence anchored
+//! → GateVerdict::Commit { cid_hex, chip_hash, proof }
+//! → Entry written to ledger
+//! ```
+//!
+//! ## Integration with Logline
+//!
+//! GateBox uses [`logline::gate`] for policy decisions and
+//! [`ubl_ledger`] for immutable append-only storage.
+
 use crate::chip_ir::Chip;
 use anyhow::{anyhow, Result};
 use logline::compiler::{compile, CompileCtx};
@@ -11,49 +42,88 @@ use std::fs;
 use std::path::Path;
 use ubl_ledger::{LedgerEntry, SimpleLedgerReader, SimpleLedgerWriter};
 
+/// A claim within an intent that requires evidence.
+///
+/// Claims are the atomic units of what an intent needs proven.
+/// Each claim has an ID and a list of evidence IDs it requires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentClaim {
+    /// Unique identifier for this claim
     pub id: String,
+    /// Evidence IDs that must be present and anchored
     pub requires: Vec<String>,
 }
 
+/// An intent document representing a user's desired action.
+///
+/// The intent is what the user wants to do. It contains claims
+/// that must be satisfied by evidence before the action can commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentDoc {
+    /// Unique identifier for this intent
     pub id: String,
+    /// The natural language description of the intent
     pub utterance: String,
+    /// Claims that must be proven with evidence
     pub claims: Vec<IntentClaim>,
+    /// Boolean feature vector for chip evaluation
     pub policy_features: Vec<bool>,
+    /// Policy version epoch for compatibility checking
     pub policy_epoch: u64,
 }
 
+/// Evidence that supports claims in an intent.
+///
+/// Evidence must be **anchored** (verified, immutable) to be accepted.
+/// Unanchored evidence causes the gate to reject.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceDoc {
+    /// Unique identifier for this evidence
     pub id: String,
+    /// Whether this evidence has been cryptographically anchored
     pub anchored: bool,
+    /// Claim IDs that this evidence supports
     pub supports: Vec<String>,
+    /// Additional payload data
     #[serde(default)]
     pub payload: Value,
 }
 
+/// The three possible outcomes of a gate evaluation.
+///
+/// This enum enforces the **No-Guess Law**: there is no fourth option.
+/// Every evaluation must result in exactly one of these verdicts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GateVerdict {
+    /// Full evidence anchored, chip evaluates true → action committed
     Commit {
+        /// Content ID of the ledger entry
         cid_hex: String,
+        /// BLAKE3 hash of the chip that was evaluated
         chip_hash: String,
+        /// Proof of the evaluation
         proof: String,
     },
+    /// Missing evidence → ask clarifying question
     Ghost {
+        /// The question to ask the user
         question: String,
     },
+    /// Contradictory evidence or chip fails → refuse
     Reject {
+        /// Human-readable reason for rejection
         reason: String,
     },
 }
 
+/// Simplified verdict for testing and validation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GateVerdictLike {
+    /// Action committed with proof
     Commit { proof: String },
+    /// Need more information
     Ghost { missing_claim: String, question: String },
+    /// Rejected with reason
     Reject { reason: String },
 }
 

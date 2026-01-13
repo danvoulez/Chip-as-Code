@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use chip_as_code::chip_ir::Chip;
 use chip_as_code::evolve::{evolve, replay, stats, Backend, EvolutionConfig, Task};
 use chip_as_code::gatebox::{run_gate, verify_ledger, GateVerdict};
-use chip_as_code::zlayer::{zlayer_demo, zlayer_evolve, zlayer_gate_demo, zlayer_gate_verify, zlayer_merge, zlayer_stress, zlayer_value, zlayer_verify, zlayer_verify_file};
+use chip_as_code::zlayer::{zlayer_demo, zlayer_diagnose, zlayer_evolve, zlayer_gate_demo, zlayer_gate_verify, zlayer_merge, zlayer_stress, zlayer_value, zlayer_verify, zlayer_verify_file, zlayer_verify_streaming};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -89,6 +89,14 @@ enum ZlayerCommands {
         dir: Option<PathBuf>,
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Use streaming mode for large files (1M+ atoms). Faster and uses less memory.
+        #[arg(long, default_value = "full")]
+        mode: String,
+    },
+    /// Deep diagnostic analysis of atom distribution and deduplication
+    Diagnose {
+        #[arg(long)]
+        file: PathBuf,
     },
     Evolve {
         #[arg(long)]
@@ -168,22 +176,103 @@ fn main() -> Result<()> {
                 zlayer_demo("out/zlayer")?;
                 println!("zlayer demo written to out/zlayer");
             }
-            ZlayerCommands::Verify { dir, file } => {
+            ZlayerCommands::Verify { dir, file, mode } => {
                 let stats = if let Some(file) = file {
-                    zlayer_verify_file(&file)?
+                    if mode == "streaming" {
+                        zlayer_verify_streaming(&file)?
+                    } else {
+                        zlayer_verify_file(&file)?
+                    }
                 } else {
                     let dir_path = dir.unwrap_or_else(|| PathBuf::from("out/zlayer"));
                     zlayer_verify(&dir_path)?
                 };
                 println!(
-                    "zlayer verified atoms_loaded={} atoms_unique={} derivations={} commit={} ghost={} reject={}",
+                    "zlayer verified atoms_loaded={} atoms_unique={} derivations={} commit={} ghost={} reject={} mode={}",
                     stats.atoms_loaded,
                     stats.atoms_unique,
                     stats.derivations_replayed,
                     stats.commits,
                     stats.ghosts,
-                    stats.rejects
+                    stats.rejects,
+                    mode
                 );
+            }
+            ZlayerCommands::Diagnose { file } => {
+                let report = zlayer_diagnose(&file)?;
+                println!("╔══════════════════════════════════════════════════════════╗");
+                println!("║           Z-Layer Diagnostic Report                      ║");
+                println!("╚══════════════════════════════════════════════════════════╝");
+                println!();
+                println!("📊 SUMMARY");
+                println!("  Total atoms: {}", report.total_atoms);
+                println!("  Unique CIDs: {}", report.unique_cids);
+                println!("  Derivations: {}", report.derivations);
+                println!("  Duplicates:  {}", report.duplicate_atoms);
+                println!();
+                
+                println!("📦 ATOM TYPES");
+                for (t, count) in &report.atom_types {
+                    println!("  {}: {}", t, count);
+                }
+                println!();
+                
+                // Template + Occurrence breakdown (the important part!)
+                println!("═══════════════════════════════════════════════════════════");
+                println!("🎯 VERDICT ANALYSIS (Template + Occurrence Pattern)");
+                println!("═══════════════════════════════════════════════════════════");
+                println!();
+                
+                println!("📋 EVENTS (occurrences = decisions executed)");
+                if report.verdict_events.is_empty() {
+                    println!("  (old format - using verdict_distribution)");
+                    for (v, count) in &report.verdict_distribution {
+                        println!("  {}: {}", v, count);
+                    }
+                } else {
+                    let total_events: usize = report.verdict_events.values().sum();
+                    println!("  Total: {}", total_events);
+                    for (v, count) in &report.verdict_events {
+                        println!("  {}: {}", v, count);
+                    }
+                }
+                println!();
+                
+                println!("📚 TEMPLATES (catalog = unique verdict reasons)");
+                if report.verdict_templates.is_empty() {
+                    println!("  (old format - using unique_verdict_cids)");
+                    for (v, count) in &report.unique_verdict_cids {
+                        println!("  {}: {}", v, count);
+                    }
+                } else {
+                    let total_templates: usize = report.verdict_templates.values().sum();
+                    println!("  Total: {}", total_templates);
+                    for (v, count) in &report.verdict_templates {
+                        println!("  {}: {}", v, count);
+                    }
+                }
+                println!();
+                
+                if !report.template_frequency.is_empty() {
+                    println!("🔥 TOP TEMPLATES BY USAGE");
+                    for (tcid, verdict, count) in &report.template_frequency {
+                        println!("  {}... [{}] → {} events", &tcid[..16], verdict, count);
+                    }
+                    println!();
+                }
+                
+                // Invariant check
+                println!("═══════════════════════════════════════════════════════════");
+                println!("✅ INVARIANT CHECK");
+                let total_events: usize = report.verdict_events.values().sum();
+                let events_ok = total_events == report.derivations || report.verdict_events.is_empty();
+                if events_ok {
+                    println!("  derivations == verdict_events: ✓ ({} == {})", 
+                             report.derivations, total_events);
+                } else {
+                    println!("  ⚠️  derivations != verdict_events: {} != {}", 
+                             report.derivations, total_events);
+                }
             }
             ZlayerCommands::Evolve {
                 task,
@@ -348,6 +437,7 @@ fn main() -> Result<()> {
                 backend: backend_enum,
             };
             let res = evolve(cfg)?;
+            #[cfg(feature = "gpu")]
             if let Some(meta) = res.backend_info.gpu.clone() {
                 println!(
                     "BACKEND {} adapter={} shader_hash={}",

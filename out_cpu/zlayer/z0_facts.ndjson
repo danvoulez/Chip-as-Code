@@ -1,3 +1,0 @@
-{"cid":"1828c7003a1cb6093d42f845d1a9992c44ea08202e6a1cffff9a65f1aaacf83b","payload":{"amount":10,"id":"f0"},"t":"atom.fact","ts":"2026-01-12T00:00:00Z","v":1}
-{"cid":"14480d5e85112d9e8276163787c2cf22cb45aef6c18f2b36eb4e19d93f8741f7","payload":{"amount":17,"id":"f1"},"t":"atom.fact","ts":"2026-01-12T00:00:00Z","v":1}
-{"cid":"64ccaf397c48eb923a0a057fe447c80e1fc2e3f8f07aa0d53ecd61b5e80e13be","payload":{"amount":20,"id":"f2"},"t":"atom.fact","ts":"2026-01-12T00:00:00Z","v":1}

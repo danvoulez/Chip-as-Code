@@ -1,6 +1,0 @@
-CHIP v0
-FEATURES n=6
-GATES m=2
-g0 = NOT(f2)
-g1 = AND(f0,f1)
-OUTPUT = g1
